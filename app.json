@@ -1,0 +1,30 @@
+{
+  "name": "MALIK-MD",
+  "description": "WhatsApp Bot with Auto Forward Features",
+  "keywords": ["whatsapp", "bot", "malik", "mongodb"],
+  "repository": "",
+  "logo": "https://i.ibb.co/d6bLQ7y/whatsapp-logo.png",
+  "success_url": "/",
+  "stack": "heroku-24",
+  "env": {
+    "SESSION_ID": {
+      "description": "Unique session ID for your bot",
+      "required": true
+    },
+    "MONGODB_URL": {
+      "description": "MongoDB connection URL",
+      "required": true
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "heroku-community/apt"
+    },
+    {
+      "url": "heroku/python"
+    },
+    {
+      "url": "heroku/nodejs"
+    }
+  ]
+}

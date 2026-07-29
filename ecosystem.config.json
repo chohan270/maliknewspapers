@@ -1,0 +1,13 @@
+{
+    "apps": [
+        {
+            "name": "malik-md-v7",
+            "script": "index.js",
+            "node_args": "--expose-gc",
+            "watch": false,
+            "env": {
+                "NODE_ENV": "production"
+            }
+        }
+    ]
+}

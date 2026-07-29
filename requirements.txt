@@ -1,0 +1,4 @@
+requests
+pillow
+pypdf
+curl_cffi

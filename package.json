@@ -1,0 +1,39 @@
+{
+  "name": "malik-md-autoforward-bot",
+  "version": "1.0.0",
+  "description": "Powerful, Light & Stable WhatsApp Bot by Mr Malik",
+  "main": "index.js",
+  "scripts": {
+    "start": "node --expose-gc index.js",
+    "pm2": "pm2 start ecosystem.config.json",
+    "pm2:stop": "pm2 stop malik-bot",
+    "pm2:logs": "pm2 logs malik-bot"
+  },
+  "keywords": [
+    "whatsapp",
+    "bot",
+    "baileys",
+    "nodejs"
+  ],
+  "author": "Malik (@MalikxChaudhary-dev)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MalikxChaudhary-dev.git"
+  },
+  "engines": {
+    "node": "20.x"
+  },
+  "type": "commonjs",
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "fs-extra": "^11.2.0",
+    "mongoose": "^9.1.3",
+    "node-cron": "^3.0.3",
+    "pino": "^10.2.0",
+    "qrcode": "^1.5.4"
+  }
+}
