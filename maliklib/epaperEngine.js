@@ -158,10 +158,12 @@ async function sendFiles(items, dateStr) {
 
     for (const { key, path: filePath } of items) {
         const fileName = path.basename(filePath);
+        const thumbPath = filePath.replace(/\.pdf$/i, '.thumb.jpg');
 
         const already = await malik_isEpaperFileSent(currentSessionId, dateStr, fileName);
         if (already) {
             await fs.remove(filePath).catch(() => {});
+            await fs.remove(thumbPath).catch(() => {});
             continue;
         }
 
@@ -172,30 +174,53 @@ async function sendFiles(items, dateStr) {
             continue;
         }
 
-        let buffer;
-        try {
-            buffer = await fs.readFile(filePath);
-        } catch (e) {
-            console.error(`[epaper] could not read ${filePath}:`, e.message);
+        if (!(await fs.pathExists(filePath))) {
+            console.error(`[epaper] file missing, skipping: ${filePath}`);
             continue;
         }
 
+        // Small preview image (few KB) -- fine to hold in memory.
+        let jpegThumbnail;
+        try {
+            jpegThumbnail = await fs.readFile(thumbPath);
+        } catch {
+            jpegThumbnail = undefined; // no thumbnail generated for this PDF, that's OK
+        }
+
+        let anySuccess = false;
         for (const jid of targets) {
             try {
+                // { url: <local path> } -> Baileys STREAMS the file straight
+                // from disk instead of loading the whole PDF into RAM. On a
+                // 512MB Heroku Basic dyno with several newspapers going out
+                // in parallel, this keeps memory usage flat instead of
+                // stacking up multiple full PDF buffers at once.
                 await currentSock.sendMessage(jid, {
-                    document: buffer,
+                    document: { url: filePath },
                     mimetype: 'application/pdf',
-                    fileName
+                    fileName,
+                    ...(jpegThumbnail ? { jpegThumbnail } : {})
                 });
+                anySuccess = true;
                 await new Promise((r) => setTimeout(r, 700)); // gentle pacing between groups
             } catch (e) {
                 console.error(`[epaper] send failed -> ${jid} (${fileName}):`, e.message);
             }
         }
 
+        if (!anySuccess) {
+            // Every group failed -- do NOT mark as sent, do NOT delete the
+            // file. Leave it in the outbox so the next tick can retry the
+            // send without having to re-download/re-watermark anything.
+            console.error(`[epaper] all sends failed for ${fileName} — keeping file, will retry`);
+            continue;
+        }
         await malik_markEpaperFileSent(currentSessionId, dateStr, fileName, key);
         sentCount++;
-        await fs.remove(filePath).catch(() => {}); // delete from Heroku /tmp ONLY, never from WhatsApp
+        // Delete from Heroku /tmp ONLY (never from WhatsApp) -- frees both
+        // disk AND the RAM Node/Baileys was using to stream/encrypt it.
+        await fs.remove(filePath).catch(() => {});
+        await fs.remove(thumbPath).catch(() => {});
     }
 
     return sentCount;
@@ -287,6 +312,22 @@ async function baqiSend(force = false) {
     console.log(`[epaper] ✅ Baqi send done: ${sentCount} sent`);
 }
 
+// Any watermarked PDF that failed to SEND (e.g. wrong/invalid target JID)
+// stays in the outbox folder untouched. This resends those on every tick
+// without needing to re-download anything.
+async function sweepOutbox(dateStr) {
+    let files = [];
+    try {
+        files = await fs.readdir(OUTBOX);
+    } catch {
+        return 0;
+    }
+    const pdfs = files.filter((f) => f.toLowerCase().endsWith('.pdf'));
+    if (!pdfs.length) return 0;
+    const items = pdfs.map((f) => ({ key: 'leftover', path: path.join(OUTBOX, f) }));
+    return sendFiles(items, dateStr);
+}
+
 // -----------------------------------------------------------------------------
 // RETRY TICK (every 15 min — failed newspapers only)
 // -----------------------------------------------------------------------------
@@ -295,6 +336,10 @@ async function retryTick() {
     if (!cfg?.enabled) return;
 
     const dateStr = pktDateStr();
+
+    const leftoverSent = await sweepOutbox(dateStr);
+    if (leftoverSent) console.log(`[epaper] 📬 Leftover sweep: ${leftoverSent} file(s) delivered`);
+
     const allPending = (cfg.pendingRetries || []).map((p) => (p.toObject ? p.toObject() : p));
     // NOTE: no attempts cap anymore -- keep retrying a newspaper every 15 min,
     // all day, until it actually succeeds. Once the date rolls over, old
@@ -435,7 +480,8 @@ async function getStatusText(sessionId) {
     text += `• \`.af epaper on/off\` — enable/disable\n`;
     text += `• \`.af epaper run\` — run everything right now\n`;
     text += `• \`.af epaper run <key>\` — test ONE newspaper (e.g. \`.af epaper run jang\`)\n`;
-    text += `• \`.af epaper keys\` — list all newspaper keys`;
+    text += `• \`.af epaper keys\` — list all newspaper keys\n`;
+    text += `• \`.af epaper clearsent\` — clear today's "already sent" records (testing)`;
 
     return text;
 }
