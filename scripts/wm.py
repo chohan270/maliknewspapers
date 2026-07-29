@@ -167,12 +167,13 @@ def apply_watermark(img, png_path, width_percent, margin_percent, position, opac
 def build_watermarked_front_page(reader):
     """Page 1 ki embedded image nikaal kar sahi watermark laga ke,
     usse ek naya single-page PDF object bana deta hai. Agar page 1
-    mein koi image na mile to None deta hai (front page bhi as-is
-    copy ho jayega)."""
+    mein koi image na mile to (None, None) deta hai (front page bhi
+    as-is copy ho jayega). Watermark ke baad ki image bhi wapis karta
+    hai taake usi se WhatsApp preview thumbnail bana sakein."""
     front_page = reader.pages[0]
     imgs = front_page.images
     if not imgs:
-        return None
+        return None, None
 
     img = imgs[0].image.convert("RGB")
 
@@ -182,23 +183,40 @@ def build_watermarked_front_page(reader):
     buf = io.BytesIO()
     img.save(buf, format="PDF")
     buf.seek(0)
-    return PdfReader(buf).pages[0]
+    return PdfReader(buf).pages[0], img
+
+
+def make_thumbnail_jpeg(img, max_width=220):
+    """Chhota JPEG thumbnail (WhatsApp preview ke liye) -- front page ki
+    (watermark ke baad wali) image se banaya jata hai."""
+    w, h = img.size
+    if w > max_width:
+        ratio = max_width / w
+        img = img.resize((max_width, max(1, int(h * ratio))), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=70)
+    return buf.getvalue()
 
 
 def process_pdf(pdf_path, output_path):
     """Public entrypoint -- epaper_scheduler.py isko har raw PDF ke liye
-    seedha call karta hai (import karke), koi subprocess nahi chahiye."""
+    seedha call karta hai (import karke), koi subprocess nahi chahiye.
+    Watermarked PDF ke sath-sath ek '<output>.thumb.jpg' bhi bana deta
+    hai (WhatsApp document-preview thumbnail ke liye) -- Node isay
+    padh kar sendMessage() mein jpegThumbnail ke tor par bhejta hai."""
     print(f"\n📄 Processing: {pdf_path}")
     reader = PdfReader(pdf_path)
     writer = PdfWriter()
 
-    watermarked_front = build_watermarked_front_page(reader)
+    watermarked_front, front_img = build_watermarked_front_page(reader)
     if watermarked_front is not None:
         writer.add_page(watermarked_front)
         print("  ✅ Page 1 (front page) watermark ho gaya")
     else:
         writer.add_page(reader.pages[0])
         print("  ⚠️ Page 1 mein image nahi mili, watermark skip (as-is copy)")
+        imgs = reader.pages[0].images
+        front_img = imgs[0].image.convert("RGB") if imgs else None
 
     for i in range(1, len(reader.pages)):
         writer.add_page(reader.pages[i])
@@ -210,6 +228,14 @@ def process_pdf(pdf_path, output_path):
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "wb") as f:
         writer.write(f)
+
+    if front_img is not None:
+        thumb_path = os.path.splitext(output_path)[0] + ".thumb.jpg"
+        try:
+            with open(thumb_path, "wb") as tf:
+                tf.write(make_thumbnail_jpeg(front_img))
+        except Exception as e:
+            print(f"  ⚠️ Thumbnail nahi ban saki: {e}")
 
     print(f"  ✅ Final PDF ready: {output_path}  ({len(writer.pages)} pages)")
     return output_path

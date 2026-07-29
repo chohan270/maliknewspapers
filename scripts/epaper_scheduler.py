@@ -61,7 +61,7 @@ PER_SCRIPT_TIMEOUT_SECONDS = int(os.environ.get("EPAPER_SCRIPT_TIMEOUT", "900"))
 # hui script baaki fast newspapers ko block na kare. subprocess.run() apna
 # wait GIL release karta hai, isliye thread-pool yahan bilkul theek kaam
 # karta hai (asal kaam alag python processes mein ho raha hota hai).
-MAX_CONCURRENCY = int(os.environ.get("EPAPER_MAX_CONCURRENCY", "6"))
+MAX_CONCURRENCY = int(os.environ.get("EPAPER_MAX_CONCURRENCY", "3"))
 
 
 def now_pkt():
