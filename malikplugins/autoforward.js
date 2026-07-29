@@ -3,21 +3,22 @@
  * Auto-Forward Command with Global Support
  * Developed by Mr Malik (ixxmalik)
  */
-const { malik_updateGroupSettings, malik_getGroupSettings, malik_getGlobalAutoForward, malik_updateGlobalAutoForward, malik_getEpaperConfig, malik_updateEpaperConfig } = require('../maliklib/database');
+const { malik_updateGroupSettings, malik_getGroupSettings, malik_getGlobalAutoForward, malik_updateGlobalAutoForward, malik_getEpaperConfig, malik_updateEpaperConfig, malik_clearEpaperSentToday } = require('../maliklib/database');
 const epaperEngine = require('../maliklib/epaperEngine');
 
 /**
- * Helper: parse a comma-separated list of JIDs and auto-add missing suffixes.
+ * Helper: extract JIDs from free-form text. Pulls out digit-sequences that
+ * look like a JID (with or without an @g.us/@s.whatsapp.net suffix already
+ * attached) and ignores any stray words typed around them — e.g.
+ * "target jid 12345-6789@g.us" still correctly yields "12345-6789@g.us".
  */
 function parseJids(input) {
-    return input.split(',').map(j => {
-        let jid = j.trim();
-        if (!jid) return null;
-        if (!jid.includes('@')) {
-            jid = jid.includes('-') ? jid + '@g.us' : jid + '@s.whatsapp.net';
-        }
-        return jid;
-    }).filter(Boolean);
+    const matches = input.match(/\d{5,}(-\d+)?(@g\.us|@s\.whatsapp\.net)?/g) || [];
+    const jids = matches.map((m) => {
+        if (m.includes('@')) return m;
+        return m.includes('-') ? `${m}@g.us` : `${m}@s.whatsapp.net`;
+    });
+    return [...new Set(jids)];
 }
 
 module.exports = {
@@ -120,6 +121,14 @@ module.exports = {
             if (sub === 'keys') {
                 return await sock.sendMessage(from, {
                     text: `📋 *Available Epaper Keys*\n\n${epaperEngine.EPAPER_KEYS.map((k) => `• ${k}`).join('\n')}\n\nExample: \`.af epaper run jang\` or \`.af epaper run jang dawn\``
+                }, { quoted: malik_msg });
+            }
+
+            if (sub === 'clearsent') {
+                const today = new Date().toLocaleString('en-CA', { timeZone: 'Asia/Karachi' }).split(',')[0];
+                const count = await malik_clearEpaperSentToday(sessionId, today);
+                return await sock.sendMessage(from, {
+                    text: `🧹 Aaj ke ${count} "sent" record(s) clear kar diye — ab dobara test/send ho sakega.`
                 }, { quoted: malik_msg });
             }
 
