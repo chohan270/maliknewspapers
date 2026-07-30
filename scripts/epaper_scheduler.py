@@ -31,6 +31,7 @@ Usage:
 
 import argparse
 import concurrent.futures
+import gc
 import glob
 import json
 import os
@@ -57,11 +58,12 @@ import wm  # noqa: E402  -- imported once; wm.process_pdf() is called per-PDF be
 # the whole 3AM/4:30AM run forever).
 PER_SCRIPT_TIMEOUT_SECONDS = int(os.environ.get("EPAPER_SCRIPT_TIMEOUT", "900"))  # 15 min
 
-# Kitni newspapers ek sath (parallel) chal sakti hain -- taake ek slow/atki
-# hui script baaki fast newspapers ko block na kare. subprocess.run() apna
-# wait GIL release karta hai, isliye thread-pool yahan bilkul theek kaam
-# karta hai (asal kaam alag python processes mein ho raha hota hai).
-MAX_CONCURRENCY = int(os.environ.get("EPAPER_MAX_CONCURRENCY", "3"))
+# Kitni newspapers ek sath (parallel) chal sakti hain. 512MB Heroku dyno par
+# 3-parallel try kiya to memory 1344MB tak chali gayi (R15 crash) -- newspaper
+# scan images bohat bade (high-res) hote hain, har script apni memory leta
+# hai. Default ab 1 (fully sequential, sabse safe) -- agar dyno bara ho
+# (1GB+) to EPAPER_MAX_CONCURRENCY=2 ya 3 try kiya ja sakta hai.
+MAX_CONCURRENCY = int(os.environ.get("EPAPER_MAX_CONCURRENCY", "1"))
 
 
 def now_pkt():
@@ -154,6 +156,11 @@ def run_one(key, workdir_root, outbox_dir):
     # small; final watermarked copies already live in outbox_dir.
     shutil.rmtree(workdir, ignore_errors=True)
 
+    # PIL/pypdf can leave decoded image buffers hanging around inside this
+    # long-lived process until the next GC cycle -- force it now, after every
+    # single newspaper, instead of letting RSS creep up across the batch.
+    gc.collect()
+
     if not final_files:
         return {"status": "failed", "display": display, "files": [], "error": "watermark step failed for all pages"}
 
@@ -167,9 +174,18 @@ def main():
                          help="Run the default edition-set for this batch (respects Sunday-only rules)")
     parser.add_argument("--editions", nargs="+", default=None,
                          help="Explicit list of newspaper keys to run (used for retries / manual run)")
+    parser.add_argument("--list-batch", choices=["express", "baqi"], default=None,
+                         help="Just print the resolved key list for this batch (JSON) and exit -- no downloading. "
+                              "Node uses this to loop one newspaper at a time (separate process each) for max "
+                              "memory isolation on small dynos.")
     parser.add_argument("--workdir", default="/tmp/epaper_work", help="Scratch working directory root")
     parser.add_argument("--outdir", default="/tmp/epaper_outbox", help="Final watermarked PDF output folder")
     args = parser.parse_args()
+
+    if args.list_batch:
+        keys = editions_for_batch(args.list_batch, is_sunday_today())
+        print("EPAPER_KEYS_JSON:" + json.dumps(keys), flush=True)
+        return
 
     os.makedirs(args.workdir, exist_ok=True)
     os.makedirs(args.outdir, exist_ok=True)
