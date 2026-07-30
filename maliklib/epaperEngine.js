@@ -3,12 +3,16 @@
  *
  * Pipeline (per requirements):
  *   Express : 3:00 AM (Sunday 5:30 AM) -> download -> watermark -> send -> delete /tmp
- *   Baqi    : 4:30 AM download -> 5:00 AM send -> delete /tmp
- *   Failed newspapers only: retried every 15 minutes (up to maxRetries)
+ *   Baqi    : 4:30 AM download (held) -> 5:00 AM send -> delete /tmp
+ *   Failed newspapers only: retried every 15 minutes, no attempt limit
  *
- * Node spawns scripts/epaper_scheduler.py (python) to do the actual
- * download + watermark work; this file only handles scheduling,
- * WhatsApp delivery, duplicate-skip and the retry queue.
+ * MEMORY DESIGN (512MB Heroku dyno): every single newspaper runs in its own
+ * short-lived `python3 epaper_scheduler.py --editions <key>` process. That
+ * process downloads, watermarks, prints its result, and exits -- so its
+ * memory is 100% handed back to the OS -- BEFORE the next newspaper's
+ * process is even started, and usually before the next one is even
+ * requested (each finished PDF is sent + deleted first). Nothing here ever
+ * runs multiple newspapers inside one long-lived python process.
  */
 const { spawn } = require('child_process');
 const path = require('path');
@@ -26,10 +30,15 @@ const SCRIPTS_DIR = path.join(__dirname, '..', 'scripts');
 const SCHEDULER_PY = path.join(SCRIPTS_DIR, 'epaper_scheduler.py');
 const WORKDIR = '/tmp/epaper_work';
 const OUTBOX = '/tmp/epaper_outbox';
+// Baqi newspapers finished between 4:30–5:00 AM (either the first pass or a
+// retry) get MOVED here so the 15-min retry sweep (which scans OUTBOX) can
+// never accidentally send them early. baqiSend() picks them up at 5:00 AM.
+const BAQI_STAGING = '/tmp/epaper_baqi_staging';
 const TZ_OPTS = { timezone: 'Asia/Karachi' };
 
 fs.ensureDirSync(WORKDIR);
 fs.ensureDirSync(OUTBOX);
+fs.ensureDirSync(BAQI_STAGING);
 
 let currentSock = null;
 let currentSessionId = null;
@@ -49,12 +58,70 @@ function pktDateStr() {
     return `${y}-${m}-${day}`;
 }
 
+// True once it's 5:00 AM PKT or later -- before that, baqi newspapers must
+// NEVER be sent, even if a retry finishes them early.
+function baqiSendTimeReached() {
+    return pktNow().getHours() >= 5;
+}
+
+// Moves a finished (watermarked) PDF + its thumbnail out of OUTBOX into the
+// baqi holding area, so the 15-min retry sweep (which only looks at OUTBOX)
+// can't send it before its scheduled 5:00 AM slot.
+async function moveToStaging(items) {
+    const staged = [];
+    for (const { key, path: filePath, display } of items) {
+        const fileName = path.basename(filePath);
+        const thumbPath = filePath.replace(/\.pdf$/i, '.thumb.jpg');
+        const destPath = path.join(BAQI_STAGING, fileName);
+        const destThumb = destPath.replace(/\.pdf$/i, '.thumb.jpg');
+        try {
+            await fs.move(filePath, destPath, { overwrite: true });
+        } catch (e) {
+            console.error(`[epaper] could not stage ${fileName}:`, e.message);
+            continue;
+        }
+        await fs.move(thumbPath, destThumb, { overwrite: true }).catch(() => {});
+        staged.push({ key, path: destPath, display });
+    }
+    return staged;
+}
+
 // -----------------------------------------------------------------------------
-// PYTHON INVOCATION
+// PYTHON INVOCATION -- ONE FRESH PROCESS PER NEWSPAPER
 // -----------------------------------------------------------------------------
-function runPython(args) {
+// Deliberately NOT batching multiple newspapers into one long-lived python
+// process. Each newspaper gets its own short-lived subprocess that fully
+// exits (and hands 100% of its memory back to the OS) before the next one
+// starts. On a small 512MB dyno this is the difference between a stable
+// run and an R15 (memory quota exceeded) crash.
+
+// Cheap call: just asks python which keys belong to a batch today (respects
+// Sunday-only rules) -- does NOT download anything.
+function listBatchKeys(batchName) {
     return new Promise((resolve) => {
-        console.log(`[epaper] launching: python3 epaper_scheduler.py ${args.join(' ')}`);
+        const proc = spawn('python3', [SCHEDULER_PY, '--list-batch', batchName], { cwd: SCRIPTS_DIR });
+        let stdout = '';
+        proc.stdout.on('data', (d) => { stdout += d.toString(); });
+        proc.stderr.on('data', (d) => process.stdout.write(`[epaper-py:err] ${d}`));
+        proc.on('close', () => {
+            const marker = stdout.trim().split('\n').reverse().find((l) => l.startsWith('EPAPER_KEYS_JSON:'));
+            if (!marker) return resolve([]);
+            try {
+                resolve(JSON.parse(marker.slice('EPAPER_KEYS_JSON:'.length)));
+            } catch {
+                resolve([]);
+            }
+        });
+        proc.on('error', () => resolve([]));
+    });
+}
+
+// Runs exactly ONE newspaper in its own process, waits for it to fully exit,
+// and returns its result.
+function runSingleEdition(key) {
+    return new Promise((resolve) => {
+        const args = ['--editions', key, '--workdir', WORKDIR, '--outdir', OUTBOX];
+        console.log(`[epaper] launching (isolated process): python3 epaper_scheduler.py ${args.join(' ')}`);
         const proc = spawn('python3', [SCHEDULER_PY, ...args], { cwd: SCRIPTS_DIR });
 
         let stdout = '';
@@ -65,87 +132,32 @@ function runPython(args) {
         proc.stderr.on('data', (d) => process.stdout.write(`[epaper-py:err] ${d}`));
 
         proc.on('close', () => {
-            const marker = stdout
-                .trim()
-                .split('\n')
-                .reverse()
-                .find((l) => l.startsWith('EPAPER_RESULT_JSON:'));
+            const marker = stdout.trim().split('\n').reverse().find((l) => l.startsWith('EPAPER_RESULT_JSON:'));
             if (!marker) {
-                console.error('[epaper] no result JSON from python scheduler');
-                return resolve({});
+                return resolve({ status: 'failed', display: key, files: [], error: 'no result JSON from python' });
             }
             try {
-                resolve(JSON.parse(marker.slice('EPAPER_RESULT_JSON:'.length)));
+                const results = JSON.parse(marker.slice('EPAPER_RESULT_JSON:'.length));
+                resolve(results[key] || { status: 'failed', display: key, files: [], error: 'missing from result' });
             } catch (e) {
-                console.error('[epaper] failed to parse result JSON:', e.message);
-                resolve({});
+                resolve({ status: 'failed', display: key, files: [], error: `bad JSON: ${e.message}` });
             }
         });
         proc.on('error', (err) => {
-            console.error('[epaper] failed to launch python:', err.message);
-            resolve({});
+            resolve({ status: 'failed', display: key, files: [], error: err.message });
         });
     });
 }
 
-// Same as runPython(), but fires onItem(key, result) THE MOMENT each newspaper
-// finishes (python scheduler runs all newspapers in parallel and streams a
-// line the instant each one is done) -- so a fast newspaper can be sent to
-// WhatsApp immediately, without waiting for slower/failing ones in the same
-// batch.
-function runPythonStreaming(args, onItem) {
-    return new Promise((resolve) => {
-        console.log(`[epaper] launching (streaming): python3 epaper_scheduler.py ${args.join(' ')}`);
-        const proc = spawn('python3', [SCHEDULER_PY, ...args], { cwd: SCRIPTS_DIR });
-
-        let buffer = '';
-        let finalResults = {};
-
-        proc.stdout.on('data', (d) => {
-            const text = d.toString();
-            process.stdout.write(`[epaper-py] ${text}`);
-            buffer += text;
-            let idx;
-            while ((idx = buffer.indexOf('\n')) !== -1) {
-                const line = buffer.slice(0, idx).trim();
-                buffer = buffer.slice(idx + 1);
-                if (line.startsWith('EPAPER_ITEM_JSON:')) {
-                    try {
-                        const obj = JSON.parse(line.slice('EPAPER_ITEM_JSON:'.length));
-                        if (onItem) onItem(obj.key, obj);
-                    } catch (e) {
-                        console.error('[epaper] bad item JSON:', e.message);
-                    }
-                } else if (line.startsWith('EPAPER_RESULT_JSON:')) {
-                    try {
-                        finalResults = JSON.parse(line.slice('EPAPER_RESULT_JSON:'.length));
-                    } catch (e) {
-                        console.error('[epaper] bad result JSON:', e.message);
-                    }
-                }
-            }
-        });
-        proc.stderr.on('data', (d) => process.stdout.write(`[epaper-py:err] ${d}`));
-
-        proc.on('close', () => resolve(finalResults));
-        proc.on('error', (err) => {
-            console.error('[epaper] failed to launch python:', err.message);
-            resolve({});
-        });
-    });
-}
-
-function flattenResults(results) {
-    const items = [];
-    const failedKeys = [];
-    for (const [key, r] of Object.entries(results || {})) {
-        if (r.status === 'ok' && r.files?.length) {
-            for (const filePath of r.files) items.push({ key, path: filePath, display: r.display });
-        } else {
-            failedKeys.push(key);
-        }
+// Downloads+watermarks+delivers newspapers ONE AT A TIME: process N must
+// fully finish (subprocess exits -> memory freed) AND get handed off via
+// onItem (which usually sends it right away) BEFORE process N+1 even starts.
+// Slower than parallel, but this is what keeps a 512MB dyno from crashing.
+async function runSequentialEditions(keys, onItem) {
+    for (const key of keys) {
+        const result = await runSingleEdition(key);
+        if (onItem) await onItem(key, result);
     }
-    return { items, failedKeys };
 }
 
 // -----------------------------------------------------------------------------
@@ -247,25 +259,19 @@ async function expressRun(force = false) {
     const dateStr = pktDateStr();
     console.log(`[epaper] 🚀 Express run starting (${dateStr})`);
 
+    const keys = await listBatchKeys('express');
     let sentCount = 0;
     const failedKeys = [];
-    const sendPromises = [];
 
-    await runPythonStreaming(['--batch', 'express', '--workdir', WORKDIR, '--outdir', OUTBOX], (key, r) => {
+    await runSequentialEditions(keys, async (key, r) => {
         if (r.status === 'ok' && r.files?.length) {
-            const items = r.files.map((f) => ({ key, path: f }));
-            // Sent the instant it's ready -- doesn't wait for other editions.
-            sendPromises.push(
-                sendFiles(items, dateStr)
-                    .then((n) => { sentCount += n; })
-                    .catch((e) => console.error('[epaper] send error:', e.message))
-            );
+            const items = r.files.map((f) => ({ key, path: f, display: r.display }));
+            sentCount += await sendFiles(items, dateStr); // sent + deleted before the NEXT edition even starts downloading
         } else {
             failedKeys.push(key);
         }
     });
 
-    await Promise.allSettled(sendPromises);
     if (failedKeys.length) await queueRetries('express', failedKeys, dateStr);
 
     await malik_updateEpaperConfig(currentSessionId, {
@@ -284,15 +290,29 @@ async function baqiDownload(force = false) {
 
     const dateStr = pktDateStr();
     console.log(`[epaper] 📥 Baqi download starting (${dateStr})`);
-    const results = await runPython(['--batch', 'baqi', '--workdir', WORKDIR, '--outdir', OUTBOX]);
-    const { items, failedKeys } = flattenResults(results);
+
+    const keys = await listBatchKeys('baqi');
+    const allStaged = [];
+    const failedKeys = [];
+
+    await runSequentialEditions(keys, async (key, r) => {
+        if (r.status === 'ok' && r.files?.length) {
+            const items = r.files.map((f) => ({ key, path: f, display: r.display }));
+            // Move out of OUTBOX (and thus fully off this process's active
+            // working set) immediately, before the next newspaper starts.
+            const staged = await moveToStaging(items);
+            allStaged.push(...staged);
+        } else {
+            failedKeys.push(key);
+        }
+    });
 
     await malik_updateEpaperConfig(currentSessionId, {
-        pendingSendBaqi: items,
+        pendingSendBaqi: allStaged,
         pendingSendDate: dateStr
     });
     if (failedKeys.length) await queueRetries('baqi', failedKeys, dateStr);
-    console.log(`[epaper] 📥 Baqi download done: ${items.length} ready, ${failedKeys.length} failed`);
+    console.log(`[epaper] 📥 Baqi download done: ${allStaged.length} ready (held until 5 AM), ${failedKeys.length} failed`);
 }
 
 async function baqiSend(force = false) {
@@ -350,23 +370,39 @@ async function retryTick() {
     const keys = [...new Set(due.map((p) => p.key))];
     console.log(`[epaper] 🔁 Retry tick: ${keys.join(', ')}`);
 
+    const holdUntilFive = !baqiSendTimeReached();
     let sentCount = 0;
     const failedKeys = [];
-    const sendPromises = [];
+    const heldBaqiItems = [];
 
-    await runPythonStreaming(['--editions', ...keys, '--workdir', WORKDIR, '--outdir', OUTBOX], (key, r) => {
+    await runSequentialEditions(keys, async (key, r) => {
         if (r.status === 'ok' && r.files?.length) {
-            const items = r.files.map((f) => ({ key, path: f }));
-            sendPromises.push(
-                sendFiles(items, dateStr)
-                    .then((n) => { sentCount += n; })
-                    .catch((e) => console.error('[epaper] send error:', e.message))
-            );
+            const items = r.files.map((f) => ({ key, path: f, display: r.display }));
+            const pendingEntry = due.find((p) => p.key === key);
+            const isBaqi = pendingEntry?.batch === 'baqi';
+
+            if (isBaqi && holdUntilFive) {
+                // A "baqi" newspaper finished early via retry, but it's
+                // still before 5:00 AM -- hold it, don't send yet.
+                const staged = await moveToStaging(items);
+                heldBaqiItems.push(...staged);
+            } else {
+                sentCount += await sendFiles(items, dateStr);
+            }
         } else {
             failedKeys.push(key);
         }
     });
-    await Promise.allSettled(sendPromises);
+
+    if (heldBaqiItems.length) {
+        const cfgNow = await malik_getEpaperConfig(currentSessionId);
+        const existing = cfgNow?.pendingSendDate === dateStr ? (cfgNow?.pendingSendBaqi || []) : [];
+        await malik_updateEpaperConfig(currentSessionId, {
+            pendingSendBaqi: [...existing, ...heldBaqiItems],
+            pendingSendDate: dateStr
+        });
+        console.log(`[epaper] 🕠 ${heldBaqiItems.length} baqi file(s) finished early via retry — held until 5:00 AM`);
+    }
 
     const stillFailed = new Set(failedKeys);
     const untouched = allPending.filter((p) => p.date !== dateStr || !keys.includes(p.key));
@@ -388,22 +424,16 @@ async function runSpecific(keys) {
     let sentCount = 0;
     const failedKeys = [];
     const okKeys = [];
-    const sendPromises = [];
 
-    await runPythonStreaming(['--editions', ...keys, '--workdir', WORKDIR, '--outdir', OUTBOX], (key, r) => {
+    await runSequentialEditions(keys, async (key, r) => {
         if (r.status === 'ok' && r.files?.length) {
             okKeys.push(key);
-            const items = r.files.map((f) => ({ key, path: f }));
-            sendPromises.push(
-                sendFiles(items, dateStr)
-                    .then((n) => { sentCount += n; })
-                    .catch((e) => console.error('[epaper] send error:', e.message))
-            );
+            const items = r.files.map((f) => ({ key, path: f, display: r.display }));
+            sentCount += await sendFiles(items, dateStr);
         } else {
             failedKeys.push(key);
         }
     });
-    await Promise.allSettled(sendPromises);
 
     if (failedKeys.length) await queueRetries('test', failedKeys, dateStr);
     return { sentCount, okKeys, failedKeys };
